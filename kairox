@@ -6,11 +6,10 @@
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 import os, sys, time, subprocess, shutil, json, re, random, socket, threading
-import signal, resource, queue
+import signal, resource, select
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from rich.console import Console
@@ -20,15 +19,11 @@ try:
     from rich.progress import (Progress, SpinnerColumn, BarColumn,
                                TextColumn, TimeElapsedColumn, TaskProgressColumn)
     from rich.rule import Rule
-    from rich.prompt import Prompt, Confirm
+    from rich.prompt import Prompt
     from rich.markup import escape
     from rich import box
     from rich.align import Align
     from rich.theme import Theme
-    from rich.columns import Columns
-    from rich.tree import Tree
-    from rich.live import Live
-    from rich.layout import Layout
 except ImportError:
     print("\n  [!] 'rich' not found.  Run:  pip install rich\n"); sys.exit(1)
 
@@ -169,7 +164,6 @@ class NucleiGuard:
         try:
             while True:
                 # Use readline with a short timeout via select
-                import select
                 ready = select.select([proc.stdout], [], [], 0.5)
                 if ready[0]:
                     line = proc.stdout.readline()
@@ -516,13 +510,6 @@ MATRIX_CHARS = "01アイウエオカキクケコサシスセソ░▒▓█▄�
 GLITCH_CHARS = "▓▒░█▄▀◆●◇□■▪▫⣿⣾⣻⢿⡿⣟⣯⣷"
 
 LGRAD = ["color(51)","color(45)","color(39)","color(33)","color(99)","color(135)"]
-SCAN_LINES_ART = [
-    "┌─────────────────────────────────────────────┐",
-    "│  SCANNING PERIMETER  ░░░░░░░░░░░░░░░░░░░░░  │",
-    "│  ENCRYPTING CHANNEL  ████████████████░░░░░  │",
-    "│  LOADING PAYLOADS    ████████████████████░  │",
-    "└─────────────────────────────────────────────┘",
-]
 
 def _center_print(content):
     console.print(Align.center(content if isinstance(content, Text) else Text(content)))
@@ -896,12 +883,15 @@ class KairoxV5:
         # Certificate transparency (passive, no tools needed)
         prog.log(f"  [bold {C2}]crt.sh[/] → certificate transparency logs ...")
         try:
-            h, b, _ = curl_get(f"https://crt.sh/?q=%.{self.target}&output=json", timeout=15)
-            for m in re.finditer(r'"name_value"\s*:\s*"([^"]+)"', b):
-                for s in m.group(1).split('\n'):
-                    s = s.strip().lower().lstrip('*.')
-                    if self.target in s: subs.add(s)
-        except: pass
+            ok_crt, crt_out = run_cmd(
+                ["curl", "-s", "--max-time", "15", "--insecure",
+                 f"https://crt.sh/?q=%.{self.target}&output=json"], 20)
+            if ok_crt and crt_out:
+                for m in re.finditer(r'"name_value"\s*:\s*"([^"]+)"', crt_out):
+                    for s in m.group(1).split('\n'):
+                        s = s.strip().lower().lstrip('*.')
+                        if self.target in s and s: subs.add(s)
+        except Exception: pass
 
         # HackerTarget API
         prog.log(f"  [bold {C2}]hackertarget[/] → passive subdomain lookup ...")
@@ -1139,8 +1129,9 @@ class KairoxV5:
 
         if tool_ok("hakrawler"):
             prog.log(f"  [bold {C2}]hakrawler[/] → active web crawl ...")
-            ok, out = run_cmd(["hakrawler", "-url", self.base_url, "-depth", "3",
-                                "-plain", "-insecure", "-timeout", "10"], 90)
+            ok, out = run_cmd(["hakrawler", "-depth", "3",
+                                "-plain", "-insecure", "-timeout", "10",
+                                "-url", self.base_url], 90)
             if ok:
                 for u in lns(out): urls.add(u)
 
@@ -1428,17 +1419,21 @@ class KairoxV5:
 
             with ThreadPoolExecutor(max_workers=12) as ex:
                 futures = {ex.submit(_probe, p): p for p in SENSITIVE}
-                for fut in as_completed(futures, timeout=120):
-                    try:
-                        result = fut.result()
-                        if result:
-                            entry, sev, code = result
-                            with self._lock:
-                                if entry not in [r[0] for r in self.results["dirs"]]:
-                                    self.results["dirs"].append(result)
-                            if sev in ("CRITICAL","HIGH","MEDIUM"):
-                                self._add(sev, "sensitive-path", entry)
-                    except: pass
+                try:
+                    for fut in as_completed(futures, timeout=120):
+                        try:
+                            result = fut.result(timeout=12)
+                            if result:
+                                entry, sev, code = result
+                                with self._lock:
+                                    if entry not in [r[0] for r in self.results["dirs"]]:
+                                        self.results["dirs"].append(result)
+                                if sev in ("CRITICAL","HIGH","MEDIUM"):
+                                    self._add(sev, "sensitive-path", entry)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass  # overall timeout — partial results kept
 
     # ── 12. XSS Parameter Scan ────────────────────────────────────────────────
     def run_xss(self, prog):
@@ -1512,9 +1507,13 @@ class KairoxV5:
         prog.log(f"  [bold {GREEN}]nuclei[/] phase 3 done ({len([l for l in lines3 if l.startswith('[')])} hits)")
 
     def _parse_nuclei_line(self, line):
+        # Skip internal guard messages and empty lines
+        if not line or line.startswith('[kx-guard]') or not line.startswith('['):
+            return
         m = re.search(r"\[(critical|high|medium|low|info)\]", line, re.I)
-        sev = m.group(1).upper() if m else "MEDIUM"
-        if sev == "INFO": sev = "INFO"
+        if not m:
+            return  # not a nuclei finding line
+        sev = m.group(1).upper()
         entry = line.strip()
         self.results["vulns"].append({"sev": sev, "desc": entry, "source": "nuclei"})
         self._add(sev, "nuclei", entry)
@@ -1584,11 +1583,12 @@ class KairoxV5:
         for param in redirect_params[:8]:
             for payload in payloads[:2]:
                 url = f"{self.base_url}/?{param}={payload}"
-                ok, out = run_cmd(["curl", "-s", "-o", "/dev/null", "-w",
-                                   "%{redirect_url}", "--max-time", "5",
-                                   "--connect-timeout", "3", "--insecure",
-                                   "-L", "-D", "-", url], 10)
-                if ok and "evil.com" in out:
+                # Do NOT follow redirects (-L) — check raw Location header instead
+                ok, out = run_cmd(["curl", "-s", "-o", "/dev/null",
+                                   "-w", "%{redirect_url}",
+                                   "--max-time", "5", "--connect-timeout", "3",
+                                   "--insecure", "-D", "-", url], 10)
+                if ok and "evil.com" in out.lower():
                     self._add("HIGH", "open-redirect",
                               f"Open redirect via ?{param}= — redirects to {payload}")
                     self.results["open_redirects"].append(f"?{param}= → {payload}")
@@ -1640,12 +1640,6 @@ class KairoxV5:
 #   REPORT RENDERER v5
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _sev_badge(sev):
-    icons = {"CRITICAL":"⬟","HIGH":"●","MEDIUM":"◆","LOW":"◈","INFO":"○"}
-    cols  = {"CRITICAL":PINK,"HIGH":RED,"MEDIUM":ORNG,"LOW":GREEN,"INFO":LBLUE}
-    c = cols.get(sev, GREY); i = icons.get(sev, "·")
-    t = Text(); t.append(f" {i} {sev:<8}", style=f"bold {c}"); return t
-
 def render_results(recon):
     elapsed = (datetime.now() - recon.start_ts).total_seconds()
     finish_animation()
@@ -1664,7 +1658,8 @@ def render_results(recon):
     risk_col = SEV_COL[risk]
 
     waf_name = recon.results["waf"][0]["name"] if recon.results["waf"] else "Unknown"
-    techs = ", ".join(recon.results["tech"][:5]) if recon.results["tech"] else "Unknown"
+    _tech_items = [t[:40] for t in recon.results["tech"][:5]]
+    techs = ", ".join(_tech_items) if _tech_items else "Unknown"
 
     meta = Table(box=box.SIMPLE, show_header=False, padding=(0, 3), border_style=TEAL, expand=False)
     meta.add_column("K", style=f"bold {TEAL}", no_wrap=True, min_width=28)
