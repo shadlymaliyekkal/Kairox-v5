@@ -136,10 +136,15 @@ if command -v apt-get &>/dev/null; then
     spinner_ok "Package index updated"
 
     for pkg in nmap nikto sslscan dnsrecon curl wget whois git openssl unzip masscan \
-                hydra sqlmap dirb gobuster whatweb netcat-openbsd dnsenum host dig \
-                wapiti fierce dnsutils; do
+                hydra sqlmap dirb gobuster whatweb dnsenum wapiti fierce; do
         apt_install "$pkg"
     done
+
+    # Kali-aware name:package mappings (binary name differs from package name)
+    apt_install "nc"       "netcat-traditional"  # netcat-openbsd not in Kali repos
+    apt_install "host"     "bind9-host"           # 'host' binary is in bind9-host
+    apt_install "dig"      "dnsutils"             # dig + nslookup in dnsutils
+    apt_install "nslookup" "dnsutils"
 
     spinner_start "Installing libpcap-dev"
     sudo apt-get install -y -qq libpcap-dev &>/dev/null 2>&1
