@@ -59,68 +59,144 @@ SEV_ICON  = {"CRITICAL":"⬟","HIGH":"●","MEDIUM":"◆","LOW":"◈","INFO":"�
 #   NUCLEI RESOURCE GUARD — prevents CPU/memory spike crash
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── RAM limit in MB for nuclei child process ─────────────────────────────────
+_NUCLEI_RAM_LIMIT_BYTES = 400 * 1024 * 1024   # 400 MB hard cap
+
+def _nuclei_preexec():
+    """Called in the child process after fork() — before nuclei starts.
+    Sets CPU nice level and virtual-memory cap so it cannot spike Kali."""
+    try:
+        os.nice(15)   # low priority — won't starve other processes
+    except Exception:
+        pass
+    try:
+        # Cap virtual address space to 400 MB — nuclei dies cleanly if exceeded
+        resource.setrlimit(resource.RLIMIT_AS,
+                           (_NUCLEI_RAM_LIMIT_BYTES, _NUCLEI_RAM_LIMIT_BYTES))
+    except Exception:
+        pass
+
+
 class NucleiGuard:
-    """Controls nuclei process resources to prevent system overload."""
-    MAX_RAM_MB   = 512      # kill nuclei if it exceeds this
-    MAX_CPU_SEC  = 180      # wall clock limit
-    CHECK_EVERY  = 3        # seconds between checks
-    RATE_LIMIT   = 15       # requests/sec to nuclei
-    CONCURRENCY  = 10       # parallel template threads
-    TIMEOUT_SEC  = 8        # per-request timeout
+    """Wraps every nuclei execution with:
+       • nice +15  (low CPU priority)
+       • RLIMIT_AS 400 MB  (hard RAM cap — nuclei killed by OS if exceeded)
+       • Wall-clock deadline watchdog thread
+       • RAM polling watchdog thread (using psutil if available)
+       • Strict rate-limit / concurrency / timeout flags
+    """
+    WALL_TIMEOUT = 90    # seconds per phase before SIGTERM
+    RATE_LIMIT   = 10    # requests/sec  (was 15 — reduced)
+    CONCURRENCY  = 5     # parallel goroutines  (was 10 — reduced)
+    TIMEOUT_SEC  = 7     # per-request HTTP timeout
+    BULK_SIZE    = 5     # templates per bulk batch
 
     @staticmethod
-    def safe_nuclei_cmd(target, templates=None, severity="critical,high,medium"):
-        """Build a safe nuclei command with resource limits."""
-        cmd = [
-            "nuclei", "-u", target,
+    def _build_cmd(target, tags, severity):
+        return [
+            "nuclei",
+            "-u",           target,
             "-silent",
-            "-severity", severity,
-            "-rate-limit",   "15",
-            "-c",            "10",
-            "-timeout",      "8",
-            "-bulk-size",    "10",
-            "-retries",      "1",
             "-no-color",
+            "-severity",    severity,
+            "-rate-limit",  str(NucleiGuard.RATE_LIMIT),
+            "-c",           str(NucleiGuard.CONCURRENCY),
+            "-timeout",     str(NucleiGuard.TIMEOUT_SEC),
+            "-bulk-size",   str(NucleiGuard.BULK_SIZE),
+            "-retries",     "0",
+            "-tags",        tags,
         ]
-        if templates:
-            cmd += ["-tags", templates]
-        else:
-            cmd += ["-tags", "cve,exposure,misconfig,default-login,takeover,tech"]
-        return cmd
 
     @staticmethod
-    def run_with_guard(cmd, wall_timeout=None):
-        """Run nuclei under a watchdog — kills if RAM or time limit breached."""
+    def run_phase(target, tags, severity, wall_timeout=None):
+        """Run one nuclei phase. Returns (ok: bool, lines: list[str]).
+        Guaranteed to return — never hangs or crashes the parent."""
         if wall_timeout is None:
-            wall_timeout = NucleiGuard.MAX_CPU_SEC
+            wall_timeout = NucleiGuard.WALL_TIMEOUT
+
+        cmd = NucleiGuard._build_cmd(target, tags, severity)
         out_lines = []
+        proc = None
+
+        def _kill(reason):
+            if proc is None:
+                return
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            out_lines.append(f"[kx-guard] nuclei stopped: {reason}")
+
+        def _ram_watchdog():
+            """Poll RAM every 3 s; kill if nuclei exceeds 350 MB RSS."""
+            try:
+                import psutil
+                p = psutil.Process(proc.pid)
+                while proc.poll() is None:
+                    time.sleep(3)
+                    try:
+                        rss = p.memory_info().rss
+                        if rss > 350 * 1024 * 1024:
+                            _kill(f"RAM limit exceeded ({rss//1024//1024} MB)")
+                            return
+                    except Exception:
+                        return
+            except Exception:
+                pass  # psutil not available — RLIMIT_AS handles it instead
+
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, preexec_fn=os.setsid
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                preexec_fn=_nuclei_preexec,   # nice + RLIMIT_AS set in child
             )
-            deadline = time.time() + wall_timeout
-            while True:
-                try:
-                    line = proc.stdout.readline()
-                except:
-                    break
-                if line:
-                    out_lines.append(line.strip())
-                elif proc.poll() is not None:
-                    break
-                if time.time() > deadline:
-                    try: os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    except: proc.terminate()
-                    out_lines.append("[kx-guard] nuclei wall-time limit reached — partial results returned")
-                    break
-                time.sleep(0.05)
-            try: proc.wait(timeout=5)
-            except: proc.kill()
         except FileNotFoundError:
-            return False, ["[not found: nuclei]"]
+            return False, ["[nuclei not found]"]
         except Exception as e:
-            return False, [f"[error: {e}]"]
+            return False, [f"[nuclei launch error: {e}]"]
+
+        # Start RAM watchdog in background thread
+        ram_thread = threading.Thread(target=_ram_watchdog, daemon=True)
+        ram_thread.start()
+
+        deadline = time.time() + wall_timeout
+        try:
+            while True:
+                # Use readline with a short timeout via select
+                import select
+                ready = select.select([proc.stdout], [], [], 0.5)
+                if ready[0]:
+                    line = proc.stdout.readline()
+                    if line:
+                        stripped = line.strip()
+                        if stripped:
+                            out_lines.append(stripped)
+                    elif proc.poll() is not None:
+                        break  # EOF + process exited
+                else:
+                    if proc.poll() is not None:
+                        break  # process exited, stdout drained
+                if time.time() > deadline:
+                    _kill("wall-time limit reached")
+                    break
+        except Exception:
+            _kill("read error")
+
+        # Give process 4 s to exit cleanly after kill signal
+        try:
+            proc.wait(timeout=4)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
         return True, out_lines
 
 
@@ -1386,34 +1462,54 @@ class KairoxV5:
         if not tool_ok("nuclei"):
             prog.log(f"  [bold {ORNG}]nuclei[/] not installed — skipping")
             return
-        prog.log(f"  [bold {C2}]nuclei[/] → CVE + misconfig scan [resource-guarded] ...")
 
-        # Phase 1: Safe exposure/misconfig templates (low CPU)
-        prog.log(f"  [bold {C2}]nuclei[/] phase 1: exposures + default-logins ...")
-        cmd1 = NucleiGuard.safe_nuclei_cmd(
+        prog.log(f"  [bold {C2}]nuclei[/] → scan running [nice+15, 400 MB RAM cap, 90s limit] ...")
+
+        # ── Phase 1: exposures + misconfigs (lightest templates) ──────────────
+        prog.log(f"  [bold {C2}]nuclei[/] phase 1/3 — exposures + misconfigs ...")
+        ok1, lines1 = NucleiGuard.run_phase(
             self.base_url,
-            templates="exposure,default-login,misconfig,takeover,tech",
-            severity="critical,high,medium"
+            tags="exposure,misconfig,takeover,tech",
+            severity="critical,high,medium",
+            wall_timeout=90,
         )
-        ok1, lines1 = NucleiGuard.run_with_guard(cmd1, wall_timeout=90)
         for l in lines1:
-            if l.startswith("["): self._parse_nuclei_line(l)
+            self._parse_nuclei_line(l)
+        prog.log(f"  [bold {GREEN}]nuclei[/] phase 1 done ({len([l for l in lines1 if l.startswith('[')])} hits)")
 
-        # Phase 2: CVE templates (heavier, strictly guarded)
-        prog.log(f"  [bold {C2}]nuclei[/] phase 2: CVE templates [guarded] ...")
-        cmd2 = NucleiGuard.safe_nuclei_cmd(
+        # ── Phase 2: default-login checks (fast, low volume) ──────────────────
+        prog.log(f"  [bold {C2}]nuclei[/] phase 2/3 — default logins ...")
+        ok2, lines2 = NucleiGuard.run_phase(
             self.base_url,
-            templates="cve",
-            severity="critical,high"
+            tags="default-login",
+            severity="critical,high",
+            wall_timeout=60,
         )
-        # Further tighten: fewer concurrent, shorter timeout for CVE phase
-        cmd2 = [c for c in cmd2]  # copy
-        for i, x in enumerate(cmd2):
-            if x == str(NucleiGuard.CONCURRENCY): cmd2[i] = "6"
-            if x == str(NucleiGuard.TIMEOUT_SEC): cmd2[i] = "6"
-        ok2, lines2 = NucleiGuard.run_with_guard(cmd2, wall_timeout=90)
         for l in lines2:
-            if l.startswith("["): self._parse_nuclei_line(l)
+            self._parse_nuclei_line(l)
+        prog.log(f"  [bold {GREEN}]nuclei[/] phase 2 done ({len([l for l in lines2 if l.startswith('[')])} hits)")
+
+        # ── Phase 3: CVE templates (heaviest — tightest guard) ────────────────
+        prog.log(f"  [bold {C2}]nuclei[/] phase 3/3 — CVEs [concurrency=3, rate=5] ...")
+        # Override to minimum safe values for CVE phase
+        saved_c = NucleiGuard.CONCURRENCY
+        saved_r = NucleiGuard.RATE_LIMIT
+        saved_b = NucleiGuard.BULK_SIZE
+        NucleiGuard.CONCURRENCY = 3
+        NucleiGuard.RATE_LIMIT  = 5
+        NucleiGuard.BULK_SIZE   = 3
+        ok3, lines3 = NucleiGuard.run_phase(
+            self.base_url,
+            tags="cve",
+            severity="critical,high",
+            wall_timeout=90,
+        )
+        NucleiGuard.CONCURRENCY = saved_c
+        NucleiGuard.RATE_LIMIT  = saved_r
+        NucleiGuard.BULK_SIZE   = saved_b
+        for l in lines3:
+            self._parse_nuclei_line(l)
+        prog.log(f"  [bold {GREEN}]nuclei[/] phase 3 done ({len([l for l in lines3 if l.startswith('[')])} hits)")
 
     def _parse_nuclei_line(self, line):
         m = re.search(r"\[(critical|high|medium|low|info)\]", line, re.I)
